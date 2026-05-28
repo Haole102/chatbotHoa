@@ -135,6 +135,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📑 *3. CỘNG SỔ & TRẠNG THÁI DOANH THU:*\n"
         "• `/capnhat [mã_đơn] [thanh_toan / huy / cho]` — Đổi trạng thái đơn hàng\n"
         "• `/donhang` — Xem các đơn đang nợ tiền (Chờ thanh toán)\n"
+        "• `/lichsu` — Xem đơn đã thu tiền hôm nay | `/lichsu 25/01` — Xem theo ngày\n"
         "• `/congso` — Xem dòng tiền thực tế thu về hôm nay & trọn đời\n\n"
         "_*Chú ý:* Nhập chữ `don` cho cành đơn, `doi` cho cành đôi. Tất cả các số tiền nhập viết liền không dấu cách (Ví dụ: 200000).",
         parse_mode="Markdown",
@@ -590,6 +591,71 @@ async def cong_so(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         await conn.close()
 
+@owner_only
+async def lich_su_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/lichsu [dd/mm] — Xem lịch sử đơn đã thanh toán. Không nhập ngày = hôm nay."""
+    from datetime import datetime, date
+
+    args = context.args
+    if args:
+        try:
+            ngay_xem = datetime.strptime(args[0], "%d/%m").replace(
+                year=date.today().year
+            ).date()
+        except ValueError:
+            await update.message.reply_text(
+                "❌ Sai định dạng ngày! Hãy gõ theo mẫu: `/lichsu 25/01`",
+                parse_mode="Markdown"
+            )
+            return
+    else:
+        ngay_xem = date.today()
+
+    conn = await get_db_connection()
+    try:
+        rows = await conn.fetch("""
+            SELECT ma_don, sdt_khach, so_canh, loai_canh, mau_sac,
+                   tong_tien_ly_tuong, giam_gia, tong_tien_thuc_te, ngay_tao
+            FROM orders
+            WHERE ngay_tao::date = $1 AND trang_thai = 'da_thanh_toan'
+            ORDER BY ngay_tao ASC
+        """, ngay_xem)
+
+        nhan_ngay = ngay_xem.strftime("%d/%m/%Y")
+
+        if not rows:
+            await update.message.reply_text(
+                f"📭 Ngày *{nhan_ngay}* chưa có đơn nào được thanh toán.",
+                parse_mode="Markdown"
+            )
+            return
+
+        tong_tien = sum(int(r["tong_tien_thuc_te"]) for r in rows)
+        tong_giam = sum(int(r["giam_gia"]) for r in rows)
+
+        lines = [f"✅ *LỊCH SỬ {len(rows)} ĐƠN ĐÃ THU TIỀN — Ngày {nhan_ngay}*\n"]
+        for i, row in enumerate(rows, 1):
+            loai_txt = "Đơn" if row["loai_canh"] == "don" else "Đôi"
+            gio = row["ngay_tao"].strftime("%H:%M")
+            lines.append(
+                f"{i}. 🔖 Đơn *#{row['ma_don']}* — {gio} — ĐT: `{row['sdt_khach']}`\n"
+                f"   ↳ {row['so_canh']} cành {loai_txt} ({row['mau_sac']})\n"
+                f"   💰 Thực thu: *{int(row['tong_tien_thuc_te']):,}đ*"
+                + (f" _(bớt {int(row['giam_gia']):,}đ)_" if row["giam_gia"] > 0 else "")
+                + "\n"
+            )
+
+        lines.append(
+            f"───────────────────\n"
+            f"🧾 Tổng *{len(rows)} đơn* | Thu về: *{tong_tien:,}đ*"
+            + (f" | Đã bớt: {tong_giam:,}đ" if tong_giam > 0 else "")
+        )
+
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Lỗi khi tra lịch sử: {str(e)}")
+    finally:
+        await conn.close()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # KHỞI CHẠY HỆ THỐNG
@@ -617,6 +683,7 @@ def main():
     application.add_handler(CommandHandler("donhang",   xem_don_hang))
     application.add_handler(CommandHandler("capnhat",   cap_nhat_don))
     application.add_handler(CommandHandler("congso",    cong_so))
+    application.add_handler(CommandHandler("lichsu",    lich_su_don))
 
     logger.info("🤖 Bot quản lý hoa lan thực chiến đang lắng nghe tín hiệu Polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
