@@ -295,9 +295,11 @@ async def tao_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """, sdt_khach, so_canh, loai_canh, mau_sac, tien_chau, tien_phu_kien, tien_ship, giam_gia, tong_tien_ly_tuong, tong_tien_thuc_te)
 
         loai_txt = "Cành đơn" if loai_canh == "don" else "Cành đôi"
+        thoi_gian_tao = __import__('datetime').datetime.now().strftime("%H:%M  %d/%m/%Y")
         await update.message.reply_text(
             f"🧾 *ĐÃ LẬP HÓA ĐƠN CHẬU LAN THÀNH CÔNG!*\n"
             f"🆔 *MÃ ĐƠN HÀNG: #{ma_don}*\n"
+            f"🕐 Thời gian lập đơn: {thoi_gian_tao}\n"
             f"📞 SĐT khách liên hệ: `{sdt_khach}`\n"
             f"🌸 Quy cách chậu: *{so_canh} cành* {loai_txt} — Màu: *{mau_sac}*\n"
             f"───────────────────\n"
@@ -415,9 +417,11 @@ async def sua_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
             """, sdt_khach, so_canh, loai_canh, mau_sac, tien_chau, tien_phu_kien, tien_ship, giam_gia, tong_tien_ly_tuong, tong_tien_thuc_te, ma_don)
 
         loai_txt = "Cành đơn" if loai_canh == "don" else "Cành đôi"
+        thoi_gian_sua = __import__('datetime').datetime.now().strftime("%H:%M  %d/%m/%Y")
         await update.message.reply_text(
             f"🔄 *ĐỒNG BỘ & SỬA ĐƠN HÀNG THÀNH CÔNG ĐÃ CẬP NHẬT KHO!*\n"
             f"🆔 Đơn hàng: *#{ma_don}*\n"
+            f"🕐 Thời gian sửa đơn: {thoi_gian_sua}\n"
             f"📞 SĐT khách điều chỉnh: `{sdt_khach}`\n"
             f"🌸 Chi tiết chậu mới: *{so_canh} cành* {loai_txt} ({mau_sac})\n"
             f"───────────────────\n"
