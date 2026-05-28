@@ -613,8 +613,10 @@ async def lich_su_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         ngay_xem = date.today()
 
-    conn = await get_db_connection()
+    nhan_ngay = ngay_xem.strftime("%d/%m/%Y")
+    conn = None  # Khởi tạo biến để an toàn cho khối finally
     try:
+        conn = await get_db_connection()
         rows = await conn.fetch("""
             SELECT ma_don, sdt_khach, so_canh, loai_canh, mau_sac,
                    tong_tien_ly_tuong, giam_gia, tong_tien_thuc_te, ngay_tao
@@ -623,7 +625,6 @@ async def lich_su_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ORDER BY ngay_tao ASC
         """, ngay_xem)
 
-        nhan_ngay = ngay_xem.strftime("%d/%m/%Y")
 
         if not rows:
             await update.message.reply_text(
