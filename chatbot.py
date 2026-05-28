@@ -13,6 +13,7 @@ Tính năng:
 import os
 import logging
 import asyncpg
+import functools  # ← thêm dòng này
 from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
@@ -110,6 +111,7 @@ async def init_db():
 
 def owner_only(func):
     """Decorator: Chặn người lạ, chỉ duy nhất chủ shop mới điều khiển được."""
+    @functools.wraps(func)   # ← thêm dòng này
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_chat.id != OWNER_CHAT_ID:
             await update.message.reply_text("⛔ Bạn không có quyền quản trị hệ thống kho này.")
@@ -558,14 +560,14 @@ async def cong_so(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rev_today = await conn.fetchval("""
             SELECT COALESCE(SUM(tong_tien_thuc_te), 0) 
             FROM orders 
-            WHERE ngay_tao::date = CURRENT_DATE AND trang_thai = 'da_thanh_toan'
+            WHERE (ngay_tao AT TIME ZONE 'Asia/Ho_Chi_Minh')::date = CURRENT_DATE AND trang_thai = 'da_thanh_toan'
         """)
 
         # 2. Tính tổng số tiền đã bớt do khách mặc cả của ngày hôm nay
         discount_today = await conn.fetchval("""
             SELECT COALESCE(SUM(giam_gia), 0) 
             FROM orders 
-            WHERE ngay_tao::date = CURRENT_DATE AND trang_thai = 'da_thanh_toan'
+            WHERE (ngay_tao AT TIME ZONE 'Asia/Ho_Chi_Minh')::date = CURRENT_DATE AND trang_thai = 'da_thanh_toan'
         """)
 
         # 3. Tính doanh thu trọn đời (tích lũy tất cả các ngày từ trước tới nay)
@@ -617,7 +619,7 @@ async def lich_su_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
             SELECT ma_don, sdt_khach, so_canh, loai_canh, mau_sac,
                    tong_tien_ly_tuong, giam_gia, tong_tien_thuc_te, ngay_tao
             FROM orders
-            WHERE ngay_tao::date = $1 AND trang_thai = 'da_thanh_toan'
+            WHERE (ngay_tao AT TIME ZONE 'Asia/Ho_Chi_Minh')::date = $1 AND trang_thai = 'da_thanh_toan'
             ORDER BY ngay_tao ASC
         """, ngay_xem)
 
