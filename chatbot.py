@@ -11,6 +11,7 @@ Tính năng:
 """
 
 import os
+import json # ← Thêm dòng này để hỗ trợ lưu cấu hình chậu ghép
 import logging
 import asyncpg
 import functools  # ← thêm dòng này
@@ -60,39 +61,37 @@ async def init_db():
     conn = await get_db_connection()
     try:
         await conn.execute("""
-            -- 1. Bảng quản lý kho hoa lan lẻ theo màu
             CREATE TABLE IF NOT EXISTS products (
                 id              SERIAL PRIMARY KEY,
-                loai_canh       VARCHAR(20) NOT NULL, -- 'don' hoặc 'doi'
-                mau_sac         VARCHAR(50) NOT NULL, -- 'trang', 'vang', 'tim', 'hong'...
-                so_luong_ton    INT NOT NULL DEFAULT 0, -- đơn vị tính: Cành lẻ
+                loai_canh       VARCHAR(20) NOT NULL,
+                mau_sac         VARCHAR(50) NOT NULL,
+                so_luong_ton    INT NOT NULL DEFAULT 0,
                 created_at      TIMESTAMP DEFAULT NOW(),
                 CONSTRAINT unique_product_type UNIQUE (loai_canh, mau_sac)
             );
 
-            -- 2. Bảng quản lý đơn hàng chậu tập trung (Bao gồm SĐT và Mặc cả)
+            -- [ĐÃ CẬP NHẬT] Bảng quản lý đơn hàng hỗ trợ chậu ghép n màu
             CREATE TABLE IF NOT EXISTS orders (
                 ma_don              SERIAL PRIMARY KEY,
                 sdt_khach           VARCHAR(20) NOT NULL,
-                so_canh             INT NOT NULL,
-                loai_canh           VARCHAR(20) NOT NULL,
-                mau_sac             VARCHAR(50) NOT NULL,
+                tong_so_canh        INT NOT NULL,
+                cau_hinh_hoa        TEXT NOT NULL, -- Lưu JSON để tiện hoàn kho tự động
+                chi_tiet_text       TEXT NOT NULL, -- Lưu text hiển thị cho hóa đơn
                 tien_chau           DECIMAL(15, 0) NOT NULL DEFAULT 0,
                 tien_phu_kien       DECIMAL(15, 0) NOT NULL DEFAULT 0,
                 tien_ship           DECIMAL(15, 0) NOT NULL DEFAULT 0,
-                giam_gia            DECIMAL(15, 0) NOT NULL DEFAULT 0, -- Số tiền bớt mặc cả vo tròn
-                tong_tien_ly_tuong  DECIMAL(15, 0) NOT NULL DEFAULT 0, -- Tính từ giá niêm yết gốc
-                tong_tien_thuc_te   DECIMAL(15, 0) NOT NULL DEFAULT 0, -- Thực thu = Lý tưởng - Giảm giá
-                trang_thai          VARCHAR(30) DEFAULT 'cho_thanh_toan', -- 'cho_thanh_toan', 'da_thanh_toan', 'da_huy'
+                giam_gia            DECIMAL(15, 0) NOT NULL DEFAULT 0,
+                tong_tien_ly_tuong  DECIMAL(15, 0) NOT NULL DEFAULT 0,
+                tong_tien_thuc_te   DECIMAL(15, 0) NOT NULL DEFAULT 0,
+                trang_thai          VARCHAR(30) DEFAULT 'cho_thanh_toan',
                 ngay_tao            TIMESTAMP DEFAULT NOW()
             );
 
-            -- 3. Bảng nhật ký biến động kho để đối soát khi cần
             CREATE TABLE IF NOT EXISTS inventory_log (
                 id              SERIAL PRIMARY KEY,
                 loai_canh       VARCHAR(20) NOT NULL,
                 mau_sac         VARCHAR(50) NOT NULL,
-                loai_giao_dich  VARCHAR(10) NOT NULL, -- 'nhap' hoặc 'xuat'
+                loai_giao_dich  VARCHAR(10) NOT NULL,
                 so_luong        INT NOT NULL,
                 ghi_chu         TEXT,
                 created_at      TIMESTAMP DEFAULT NOW()
@@ -103,7 +102,6 @@ async def init_db():
         logger.error(f"❌ Database initialization failed: {e}")
     finally:
         await conn.close()
-
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PHÂN QUYỀN TRUY CẬP CHỦ SHOP
@@ -227,217 +225,177 @@ async def xem_ton_kho(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def tao_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/taodon [số_cành] [loại_cành] [màu] [tiền_chậu] [phụ_kiện] [ship] [giảm_giá] [sđt_khách]"""
+    """/taodon [sốcành] [loại] [màu] ... [tiền_chậu] [phụ_kiện] [ship] [giảm_giá] [sđt_khách]"""
     args = context.args
-    if len(args) != 8:
+    # Kiểm tra xem độ dài tham số có hợp lệ không (Phải có 5 tham số cuối cố định, phần còn lại chia hết cho 3)
+    if len(args) < 8 or (len(args) - 5) % 3 != 0:
         await update.message.reply_text(
-            "❌ *Sai cú pháp tạo đơn!*\n"
-            "Mẫu chuẩn in sẵn:\n`/taodon [số_cành] [loại_cành] [màu] [tiền_chậu] [phụ_kiện] [ship] [giảm_giá] [sđt_khách]`\n\n"
-            "Ví dụ: `/taodon 10 don vang 200000 100000 150000 50000 0912345678`",
+            "❌ *Sai cú pháp tạo đơn ghép!*\n"
+            "Mẫu: `/taodon [số] [loại] [màu] ... [tiền_chậu] [phụ_kiện] [ship] [giảm_giá] [sđt_khách]`\n\n"
+            "Ví dụ chậu mix 2 loại: `/taodon 3 don vang 2 doi trang 200000 100000 150000 50000 0912345678`",
             parse_mode="Markdown"
         )
         return
 
     try:
-        so_canh = int(args[0])
-        loai_canh = args[1].lower().strip()
-        mau_sac = args[2].lower().strip()
-        tien_chau = int(args[3])
-        tien_phu_kien = int(args[4])
-        tien_ship = int(args[5])
-        giam_gia = int(args[6])
-        sdt_khach = args[7].strip()
+        # Lấy 5 tham số chi phí ở cuối cùng
+        tien_chau, tien_phu_kien, tien_ship, giam_gia = map(int, args[-5:-1])
+        sdt_khach = args[-1].strip()
+        if any(v < 0 for v in [tien_chau, tien_phu_kien, tien_ship, giam_gia]): raise ValueError
 
-        if so_canh <= 0 or tien_chau < 0 or tien_phu_kien < 0 or tien_ship < 0 or giam_gia < 0:
-            raise ValueError
-        if loai_canh not in ["don", "doi"]:
-            await update.message.reply_text("❌ Nhầm loại cành! Chỉ được gõ chữ `don` hoặc `doi`.")
-            return
+        # Lọc danh sách cấu hình hoa ở phần đầu
+        flower_args = args[:-5]
+        danh_sach_hoa = []
+        tong_so_canh = 0
+        tien_hoa_goc = 0
+        chi_tiet_text_list = []
+
+        for i in range(0, len(flower_args), 3):
+            so_c = int(flower_args[i])
+            loai = flower_args[i+1].lower().strip()
+            mau = flower_args[i+2].lower().strip()
+            
+            if so_c <= 0 or loai not in ["don", "doi"]: raise ValueError
+            
+            danh_sach_hoa.append({"so_canh": so_c, "loai": loai, "mau": mau})
+            tong_so_canh += so_c
+            tien_hoa_goc += so_c * PRICES[loai]
+            loai_txt = "Đơn" if loai == "don" else "Đôi"
+            chi_tiet_text_list.append(f"{so_c} {loai_txt} {mau}")
+
+        chi_tiet_hoa_str = " + ".join(chi_tiet_text_list)
+        cau_hinh_json = json.dumps(danh_sach_hoa)
+
     except ValueError:
-        await update.message.reply_text("❌ Lỗi định dạng! Số cành phải > 0, các ô chi phí phải ghi số liền nhau không có chữ hoặc dấu cách.")
+        await update.message.reply_text("❌ Lỗi định dạng! Hãy kiểm tra lại các con số và loại cành (chỉ điền don/doi).")
         return
 
     conn = await get_db_connection()
     try:
         async with conn.transaction():
-            # 1. Kiểm tra lượng tồn kho của màu lan này xem có đủ cắm chậu không
-            stock = await conn.fetchval(
-                "SELECT so_luong_ton FROM products WHERE loai_canh = $1 AND mau_sac = $2", 
-                loai_canh, mau_sac
-            )
-            if stock is None or stock < so_canh:
-                hiat_stock = stock if stock is not None else 0
-                await update.message.reply_text(
-                    f"❌ *Chặn giao dịch: Kho thiếu hoa!*\n"
-                    f"Trong vườn loại `lan_{loai_canh}_{mau_sac}` hiện chỉ còn *{hiat_stock} cành*.\n"
-                    f"Mẹ không đủ *{so_canh} cành* để cắm chậu này. Hãy nhập thêm hàng trước!",
-                    parse_mode="Markdown"
+            # 1. Kiểm tra tồn kho hàng loạt xem có đủ cắm nguyên chậu không
+            for hoa in danh_sach_hoa:
+                stock = await conn.fetchval(
+                    "SELECT so_luong_ton FROM products WHERE loai_canh = $1 AND mau_sac = $2", 
+                    hoa['loai'], hoa['mau']
                 )
-                return
+                if stock is None or stock < hoa['so_canh']:
+                    hien_tai = stock if stock is not None else 0
+                    await update.message.reply_text(f"❌ *Thiếu hàng!* Loại `{hoa['loai']}-{hoa['mau']}` trong vườn chỉ còn *{hien_tai} cành*.", parse_mode="Markdown")
+                    return
 
-            # 2. Khấu trừ trực tiếp số hoa ra khỏi kho vườn
-            await conn.execute(
-                "UPDATE products SET so_luong_ton = so_luong_ton - $1 WHERE loai_canh = $2 AND mau_sac = $3",
-                so_canh, loai_canh, mau_sac
-            )
-            await conn.execute(
-                "INSERT INTO inventory_log (loai_canh, mau_sac, loai_giao_dich, so_luong, ghi_chu) VALUES ($1, $2, 'xuat', $3, 'Xuất cắm chậu bán')",
-                loai_canh, mau_sac, so_canh
-            )
+            # 2. Khấu trừ kho hàng loạt
+            for hoa in danh_sach_hoa:
+                await conn.execute("UPDATE products SET so_luong_ton = so_luong_ton - $1 WHERE loai_canh = $2 AND mau_sac = $3", hoa['so_canh'], hoa['loai'], hoa['mau'])
+                await conn.execute("INSERT INTO inventory_log (loai_canh, mau_sac, loai_giao_dich, so_luong, ghi_chu) VALUES ($1, $2, 'xuat', $3, 'Xuất cắm chậu ghép')", hoa['loai'], hoa['mau'], hoa['so_canh'])
 
-            # 3. Tính toán dòng tiền tự động hóa 100%
-            gia_goc_canh = PRICES[loai_canh]
-            tong_tien_ly_tuong = (so_canh * gia_goc_canh) + tien_chau + tien_phu_kien + tien_ship
+            # 3. Tính tiền
+            tong_tien_ly_tuong = tien_hoa_goc + tien_chau + tien_phu_kien + tien_ship
             tong_tien_thuc_te = tong_tien_ly_tuong - giam_gia
 
-            # 4. Lưu dữ liệu phẳng vào bảng Orders tập trung
+            # 4. Lưu đơn
             ma_don = await conn.fetchval("""
-                INSERT INTO orders (sdt_khach, so_canh, loai_canh, mau_sac, tien_chau, tien_phu_kien, tien_ship, giam_gia, tong_tien_ly_tuong, tong_tien_thuc_te, trang_thai)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'cho_thanh_toan')
-                RETURNING ma_don
-            """, sdt_khach, so_canh, loai_canh, mau_sac, tien_chau, tien_phu_kien, tien_ship, giam_gia, tong_tien_ly_tuong, tong_tien_thuc_te)
+                INSERT INTO orders (sdt_khach, tong_so_canh, cau_hinh_hoa, chi_tiet_text, tien_chau, tien_phu_kien, tien_ship, giam_gia, tong_tien_ly_tuong, tong_tien_thuc_te, trang_thai)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'cho_thanh_toan') RETURNING ma_don
+            """, sdt_khach, tong_so_canh, cau_hinh_json, chi_tiet_hoa_str, tien_chau, tien_phu_kien, tien_ship, giam_gia, tong_tien_ly_tuong, tong_tien_thuc_te)
 
-        loai_txt = "Cành đơn" if loai_canh == "don" else "Cành đôi"
         thoi_gian_tao = __import__('datetime').datetime.now().strftime("%H:%M  %d/%m/%Y")
         await update.message.reply_text(
             f"🧾 *ĐÃ LẬP HÓA ĐƠN CHẬU LAN THÀNH CÔNG!*\n"
-            f"🆔 *MÃ ĐƠN HÀNG: #{ma_don}*\n"
-            f"🕐 Thời gian lập đơn: {thoi_gian_tao}\n"
-            f"📞 SĐT khách liên hệ: `{sdt_khach}`\n"
-            f"🌸 Quy cách chậu: *{so_canh} cành* {loai_txt} — Màu: *{mau_sac}*\n"
+            f"🆔 *Mã Đơn: #{ma_don}*\n🕐 Thời gian: {thoi_gian_tao}\n📞 SĐT khách: `{sdt_khach}`\n"
+            f"🌸 Cấu hình: *{chi_tiet_hoa_str}* (Tổng: {tong_so_canh} cành)\n"
             f"───────────────────\n"
-            f"💵 Tiền hoa gốc ({so_canh}c x {gia_goc_canh:,}đ): {so_canh * gia_goc_canh:,}đ\n"
-            f"🏺 Phôi chậu sứ/gỗ: {tien_chau:,}đ\n"
-            f"🎀 Phụ kiện trang trí + Công cắm: {tien_phu_kien:,}đ\n"
-            f"🚗 Phí ship Tết điều động đường xa: {tien_ship:,}đ\n"
-            f"📉 Bớt giá khách mặc cả vo tròn: -{giam_gia:,}đ\n"
+            f"💵 Tiền hoa gốc: {tien_hoa_goc:,}đ\n"
+            f"🏺 Chậu: {tien_chau:,}đ | 🎀 Phụ kiện: {tien_phu_kien:,}đ | 🚗 Ship: {tien_ship:,}đ\n"
+            f"📉 Giảm giá: -{giam_gia:,}đ\n"
             f"───────────────────\n"
-            f"💰 *TỔNG DOANH THU LÝ TƯỞNG:* {tong_tien_ly_tuong:,}đ\n"
-            f"⭐ *TIỀN THỰC TẾ PHẢI THU:* `{tong_tien_thuc_te:,}đ`\n"
-            f"⏳ Trạng thái: *CHỜ THANH TOÁN*\n\n"
-            f"👉 Khi khách trả tiền, gõ lệnh duyệt: `/capnhat {ma_don} thanh_toan`",
-            parse_mode="Markdown"
+            f"💰 *TỔNG THỰC THU:* `{tong_tien_thuc_te:,}đ`\n"
+            f"⏳ Trạng thái: *CHỜ THANH TOÁN*", parse_mode="Markdown"
         )
     except Exception as e:
-        await update.message.reply_text(f"❌ Lỗi hệ thống khi tạo hóa đơn: {str(e)}")
+        await update.message.reply_text(f"❌ Lỗi hệ thống: {str(e)}")
     finally:
         await conn.close()
 
 
 @owner_only
 async def sua_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/suadon [mã_đơn] [số_cành] [loại_cành] [màu] [tiền_chậu] [phụ_kiện] [ship] [giảm_giá] [sđt_khách]"""
+    """/suadon [mã_đơn] [sốcành] [loại] [màu] ... [tiền_chậu] [phụ_kiện] [ship] [giảm_giá] [sđt_khách]"""
     args = context.args
-    if len(args) != 9:
-        await update.message.reply_text(
-            "❌ *Sai cú pháp sửa đơn!*\n"
-            "Mẫu chuẩn in sẵn:\n`/suadon [mã_đơn] [số_cành] [loại_cành] [màu] [tiền_chậu] [phụ_kiện] [ship] [giảm_giá] [sđt_khách]`",
-            parse_mode="Markdown"
-        )
+    if len(args) < 9 or (len(args) - 6) % 3 != 0:
+        await update.message.reply_text("❌ *Sai cú pháp sửa đơn ghép!*", parse_mode="Markdown")
         return
 
     try:
         ma_don = int(args[0])
-        so_canh = int(args[1])
-        loai_canh = args[2].lower().strip()
-        mau_sac = args[3].lower().strip()
-        tien_chau = int(args[4])
-        tien_phu_kien = int(args[5])
-        tien_ship = int(args[6])
-        giam_gia = int(args[7])
-        sdt_khach = args[8].strip()
+        tien_chau, tien_phu_kien, tien_ship, giam_gia = map(int, args[-5:-1])
+        sdt_khach = args[-1].strip()
 
-        if ma_don <= 0 or so_canh <= 0 or tien_chau < 0 or tien_phu_kien < 0 or tien_ship < 0 or giam_gia < 0:
-            raise ValueError
-        if loai_canh not in ["don", "doi"]:
-            await update.message.reply_text("❌ Nhầm loại cành! Chỉ được gõ chữ `don` hoặc `doi`.")
-            return
+        flower_args = args[1:-5]
+        danh_sach_hoa_moi = []
+        tong_so_canh = 0
+        tien_hoa_goc = 0
+        chi_tiet_text_list = []
+
+        for i in range(0, len(flower_args), 3):
+            so_c = int(flower_args[i])
+            loai = flower_args[i+1].lower().strip()
+            mau = flower_args[i+2].lower().strip()
+            danh_sach_hoa_moi.append({"so_canh": so_c, "loai": loai, "mau": mau})
+            tong_so_canh += so_c
+            tien_hoa_goc += so_c * PRICES[loai]
+            loai_txt = "Đơn" if loai == "don" else "Đôi"
+            chi_tiet_text_list.append(f"{so_c} {loai_txt} {mau}")
+
+        chi_tiet_hoa_str = " + ".join(chi_tiet_text_list)
+        cau_hinh_json = json.dumps(danh_sach_hoa_moi)
+
     except ValueError:
-        await update.message.reply_text("❌ Kiểm tra lại định dạng số của mã đơn hoặc tiền bạc.")
+        await update.message.reply_text("❌ Lỗi định dạng số liệu.")
         return
 
     conn = await get_db_connection()
     try:
         async with conn.transaction():
-            # Truy vấn thông tin của đơn hàng cũ trước khi sửa
-            old_order = await conn.fetchrow(
-                "SELECT so_canh, loai_canh, mau_sac, trang_thai FROM orders WHERE ma_don = $1", 
-                ma_don
-            )
+            old_order = await conn.fetchrow("SELECT cau_hinh_hoa, trang_thai FROM orders WHERE ma_don = $1", ma_don)
             if not old_order:
-                await update.message.reply_text(f"❌ Không tồn tại mã đơn hàng #{ma_don} trong sổ sách.")
+                await update.message.reply_text(f"❌ Không tồn tại mã đơn #{ma_don}.")
                 return
 
-            old_so_canh = old_order["so_canh"]
-            old_loai_canh = old_order["loai_canh"]
-            old_mau_sac = old_order["mau_sac"]
-            old_trang_thai = old_order["trang_thai"]
+            # BƯỚC 1: Hoàn lại hoa cũ về kho
+            if old_order["trang_thai"] != 'da_huy':
+                old_cau_hinh = json.loads(old_order["cau_hinh_hoa"])
+                for hoa in old_cau_hinh:
+                    await conn.execute("""
+                        INSERT INTO products (loai_canh, mau_sac, so_luong_ton) VALUES ($1, $2, $3)
+                        ON CONFLICT (loai_canh, mau_sac) DO UPDATE SET so_luong_ton = products.so_luong_ton + EXCLUDED.so_luong_ton
+                    """, hoa['loai'], hoa['mau'], hoa['so_canh'])
+                    await conn.execute("INSERT INTO inventory_log (loai_canh, mau_sac, loai_giao_dich, so_luong, ghi_chu) VALUES ($1, $2, 'nhap', $3, 'Hoàn kho sửa đơn')", hoa['loai'], hoa['mau'], hoa['so_canh'])
 
-            # BƯỚC 1: Hoàn kho trả lại hoa cũ về vườn (nếu đơn cũ không phải là đơn đã hủy)
-            if old_trang_thai != 'da_huy':
-                await conn.execute("""
-                    INSERT INTO products (loai_canh, mau_sac, so_luong_ton) 
-                    VALUES ($1, $2, $3) 
-                    ON CONFLICT (loai_canh, mau_sac) 
-                    DO UPDATE SET so_luong_ton = products.so_luong_ton + EXCLUDED.so_luong_ton
-                """, old_loai_canh, old_mau_sac, old_so_canh)
-                await conn.execute(
-                    "INSERT INTO inventory_log (loai_canh, mau_sac, loai_giao_dich, so_luong, ghi_chu) VALUES ($1, $2, 'nhap', $3, $4)",
-                    old_loai_canh, old_mau_sac, old_so_canh, f"Hoàn kho tự động để sửa đơn #{ma_don}"
-                )
+            # BƯỚC 2: Kiểm tra tồn kho cấu hình mới
+            for hoa in danh_sach_hoa_moi:
+                stock = await conn.fetchval("SELECT so_luong_ton FROM products WHERE loai_canh = $1 AND mau_sac = $2", hoa['loai'], hoa['mau'])
+                if stock is None or stock < hoa['so_canh']:
+                    hien_tai = stock if stock is not None else 0
+                    raise Exception(f"Thiếu hàng! Loại {hoa['loai']}-{hoa['mau']} chỉ còn {hien_tai} cành.")
 
-            # BƯỚC 2: Kiểm tra kho xem có đủ loại hoa mới theo yêu cầu sửa đơn không
-            stock = await conn.fetchval(
-                "SELECT so_luong_ton FROM products WHERE loai_canh = $1 AND mau_sac = $2", 
-                loai_canh, mau_sac
-            )
-            if stock is None or stock < so_canh:
-                hiat_stock = stock if stock is not None else 0
-                # Kích hoạt Rollback hủy toàn bộ giao dịch, giữ nguyên đơn cũ để bảo vệ an toàn hệ thống
-                raise Exception(f"Không đủ hoa trong vườn cho cấu hình mới! Loại {loai_canh}-{mau_sac} chỉ còn {hiat_stock} cành.")
+            # BƯỚC 3: Khấu trừ cấu hình mới
+            for hoa in danh_sach_hoa_moi:
+                await conn.execute("UPDATE products SET so_luong_ton = so_luong_ton - $1 WHERE loai_canh = $2 AND mau_sac = $3", hoa['so_canh'], hoa['loai'], hoa['mau'])
+                await conn.execute("INSERT INTO inventory_log (loai_canh, mau_sac, loai_giao_dich, so_luong, ghi_chu) VALUES ($1, $2, 'xuat', $3, 'Trừ kho sửa đơn')", hoa['loai'], hoa['mau'], hoa['so_canh'])
 
-            # BƯỚC 3: Khấu trừ kho theo số lượng cấu hình hoa mới
-            await conn.execute(
-                "UPDATE products SET so_luong_ton = so_luong_ton - $1 WHERE loai_canh = $2 AND mau_sac = $3",
-                so_canh, loai_canh, mau_sac
-            )
-            await conn.execute(
-                "INSERT INTO inventory_log (loai_canh, mau_sac, loai_giao_dich, so_luong, ghi_chu) VALUES ($1, $2, 'xuat', $3, $4)",
-                loai_canh, mau_sac, so_canh, f"Trừ kho cấu hình mới từ sửa đơn #{ma_don}"
-            )
-
-            # BƯỚC 4: Tính toán lại toàn bộ tiền và ghi đè cập nhật hóa đơn
-            gia_goc_canh = PRICES[loai_canh]
-            tong_tien_ly_tuong = (so_canh * gia_goc_canh) + tien_chau + tien_phu_kien + tien_ship
+            # BƯỚC 4: Cập nhật hóa đơn
+            tong_tien_ly_tuong = tien_hoa_goc + tien_chau + tien_phu_kien + tien_ship
             tong_tien_thuc_te = tong_tien_ly_tuong - giam_gia
 
             await conn.execute("""
-                UPDATE orders 
-                SET sdt_khach = $1, so_canh = $2, loai_canh = $3, mau_sac = $4, 
-                    tien_chau = $5, tien_phu_kien = $6, tien_ship = $7, giam_gia = $8, 
-                    tong_tien_ly_tuong = $9, tong_tien_thuc_te = $10
-                WHERE ma_don = $11
-            """, sdt_khach, so_canh, loai_canh, mau_sac, tien_chau, tien_phu_kien, tien_ship, giam_gia, tong_tien_ly_tuong, tong_tien_thuc_te, ma_don)
+                UPDATE orders SET sdt_khach = $1, tong_so_canh = $2, cau_hinh_hoa = $3, chi_tiet_text = $4,
+                tien_chau = $5, tien_phu_kien = $6, tien_ship = $7, giam_gia = $8, tong_tien_ly_tuong = $9, tong_tien_thuc_te = $10 WHERE ma_don = $11
+            """, sdt_khach, tong_so_canh, cau_hinh_json, chi_tiet_hoa_str, tien_chau, tien_phu_kien, tien_ship, giam_gia, tong_tien_ly_tuong, tong_tien_thuc_te, ma_don)
 
-        loai_txt = "Cành đơn" if loai_canh == "don" else "Cành đôi"
-        thoi_gian_sua = __import__('datetime').datetime.now().strftime("%H:%M  %d/%m/%Y")
-        await update.message.reply_text(
-            f"🔄 *ĐỒNG BỘ & SỬA ĐƠN HÀNG THÀNH CÔNG ĐÃ CẬP NHẬT KHO!*\n"
-            f"🆔 Đơn hàng: *#{ma_don}*\n"
-            f"🕐 Thời gian sửa đơn: {thoi_gian_sua}\n"
-            f"📞 SĐT khách điều chỉnh: `{sdt_khach}`\n"
-            f"🌸 Chi tiết chậu mới: *{so_canh} cành* {loai_txt} ({mau_sac})\n"
-            f"───────────────────\n"
-            f"🏺 Chậu: {tien_chau:,}đ | 🎀 Phụ kiện: {tien_phu_kien:,}đ | 🚗 Ship: {tien_ship:,}đ\n"
-            f"📉 Mặc cả bớt mới: -{giam_gia:,}đ\n"
-            f"───────────────────\n"
-            f"💰 *TỔNG LÝ TƯỞNG MỚI:* {tong_tien_ly_tuong:,}đ\n"
-            f"⭐ *TIỀN THỰC TẾ PHẢI THU MỚI:* `{tong_tien_thuc_te:,}đ`\n"
-            f"🔄 Trạng thái đơn giữ nguyên: *{old_trang_thai.upper()}*",
-            parse_mode="Markdown"
-        )
+        await update.message.reply_text(f"🔄 *ĐÃ SỬA ĐƠN #{ma_don} THÀNH CÔNG!*\n🌸 Cấu hình mới: {chi_tiet_hoa_str}\n💰 Thực thu mới: `{tong_tien_thuc_te:,}đ`", parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"❌ Huỷ lệnh sửa đơn do lỗi: {str(e)}")
+        await update.message.reply_text(f"❌ Hủy sửa đơn do lỗi: {str(e)}")
     finally:
         await conn.close()
 
@@ -446,106 +404,55 @@ async def sua_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cap_nhat_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/capnhat [mã_đơn] [thanh_toan / huy / cho]"""
     args = context.args
-    if len(args) != 2:
-        await update.message.reply_text("❌ Sai cú pháp! Hãy gõ: `/capnhat [mã_đơn] thanh_toan` hoặc `huy` hoặc `cho`")
-        return
-
-    try:
-        ma_don = int(args[0])
-        input_status = args[1].lower().strip()
-    except ValueError:
-        await update.message.reply_text("❌ Mã đơn hàng bắt buộc phải là một số nguyên.")
-        return
-
-    status_map = {
-        "thanh_toan": "da_thanh_toan",
-        "huy": "da_huy",
-        "cho": "cho_thanh_toan"
-    }
-
-    if input_status not in status_map:
-        await update.message.reply_text("❌ Lệnh sai! Trạng thái chỉ được ghi chữ: `thanh_toan`, `huy` hoặc `cho`.")
-        return
-
-    new_status = status_map[input_status]
+    if len(args) != 2: return await update.message.reply_text("❌ Dùng: `/capnhat [mã_đơn] thanh_toan` / `huy` / `cho`")
+    
+    ma_don = int(args[0])
+    status_map = {"thanh_toan": "da_thanh_toan", "huy": "da_huy", "cho": "cho_thanh_toan"}
+    if args[1].lower() not in status_map: return await update.message.reply_text("❌ Sai trạng thái.")
+    
+    new_status = status_map[args[1].lower()]
     conn = await get_db_connection()
     try:
         async with conn.transaction():
-            order = await conn.fetchrow("SELECT so_canh, loai_canh, mau_sac, trang_thai FROM orders WHERE ma_don = $1", ma_don)
-            if not order:
-                await update.message.reply_text(f"❌ Không tìm thấy mã đơn #{ma_don} trong sổ ghi chép.")
-                return
+            order = await conn.fetchrow("SELECT cau_hinh_hoa, trang_thai FROM orders WHERE ma_don = $1", ma_don)
+            if not order: return await update.message.reply_text("❌ Không tìm thấy đơn hàng.")
+            if order["trang_thai"] == new_status: return await update.message.reply_text("ℹ️ Trạng thái đã trùng.")
 
-            old_status = order["trang_thai"]
-            so_canh = order["so_canh"]
-            loai_canh = order["loai_canh"]
-            mau_sac = order["mau_sac"]
+            cau_hinh = json.loads(order["cau_hinh_hoa"])
+            
+            # XỬ LÝ HỦY ĐƠN: Hoàn kho hàng loạt
+            if new_status == "da_huy":
+                for hoa in cau_hinh:
+                    await conn.execute("INSERT INTO products (loai_canh, mau_sac, so_luong_ton) VALUES ($1, $2, $3) ON CONFLICT (loai_canh, mau_sac) DO UPDATE SET so_luong_ton = products.so_luong_ton + EXCLUDED.so_luong_ton", hoa['loai'], hoa['mau'], hoa['so_canh'])
+                    await conn.execute("INSERT INTO inventory_log (loai_canh, mau_sac, loai_giao_dich, so_luong, ghi_chu) VALUES ($1, $2, 'nhap', $3, 'Hoàn kho hủy đơn')", hoa['loai'], hoa['mau'], hoa['so_canh'])
+            
+            # XỬ LÝ KHÔI PHỤC ĐƠN HỦY: Trừ kho hàng loạt
+            elif order["trang_thai"] == "da_huy":
+                for hoa in cau_hinh:
+                    stock = await conn.fetchval("SELECT so_luong_ton FROM products WHERE loai_canh = $1 AND mau_sac = $2", hoa['loai'], hoa['mau'])
+                    if stock is None or stock < hoa['so_canh']: raise Exception(f"Không đủ hoa {hoa['loai']}-{hoa['mau']} để khôi phục đơn!")
+                    await conn.execute("UPDATE products SET so_luong_ton = so_luong_ton - $1 WHERE loai_canh = $2 AND mau_sac = $3", hoa['so_canh'], hoa['loai'], hoa['mau'])
+                    await conn.execute("INSERT INTO inventory_log (loai_canh, mau_sac, loai_giao_dich, so_luong, ghi_chu) VALUES ($1, $2, 'xuat', $3, 'Trừ kho phục hồi đơn')", hoa['loai'], hoa['mau'], hoa['so_canh'])
 
-            if old_status == new_status:
-                await update.message.reply_text(f"ℹ️ Đơn hàng #{ma_don} hiện tại vốn dĩ đã ở trạng thái *{new_status.upper()}* rồi.", parse_mode="Markdown")
-                return
-
-            # XỬ LÝ KHO KHI THAY ĐỔI TRẠNG THÁI HỦY ĐƠN
-            if new_status == "da_huy" and old_status != "da_huy":
-                # Trả lại hoa lan về vườn vì khách hủy đơn bùng hàng
-                await conn.execute("""
-                    INSERT INTO products (loai_canh, mau_sac, so_luong_ton) 
-                    VALUES ($1, $2, $3) 
-                    ON CONFLICT (loai_canh, mau_sac) 
-                    DO UPDATE SET so_luong_ton = products.so_luong_ton + EXCLUDED.so_luong_ton
-                """, loai_canh, mau_sac, so_canh)
-                await conn.execute(
-                    "INSERT INTO inventory_log (loai_canh, mau_sac, loai_giao_dich, so_luong, ghi_chu) VALUES ($1, $2, 'nhap', $3, $4)",
-                    loai_canh, mau_sac, so_canh, f"Hoàn kho do hủy đơn hàng #{ma_don}"
-                )
-            elif old_status == "da_huy" and new_status != "da_huy":
-                # Khôi phục lại đơn đã hủy -> Phải khấu trừ lại kho, nếu kho không đủ thì chặn lại
-                stock = await conn.fetchval("SELECT so_luong_ton FROM products WHERE loai_canh = $1 AND mau_sac = $2", loai_canh, mau_sac)
-                if stock is None or stock < so_canh:
-                    hiat_stock = stock if stock is not None else 0
-                    raise Exception(f"Kho vườn không đủ hoa để khôi phục lại đơn! Loại {loai_canh}-{mau_sac} chỉ còn {hiat_stock} cành.")
-                await conn.execute(
-                    "UPDATE products SET so_luong_ton = so_luong_ton - $1 WHERE loai_canh = $2 AND mau_sac = $3",
-                    so_canh, loai_canh, mau_sac
-                )
-                await conn.execute(
-                    "INSERT INTO inventory_log (loai_canh, mau_sac, loai_giao_dich, so_luong, ghi_chu) VALUES ($1, $2, 'xuat', $3, $4)",
-                    loai_canh, mau_sac, so_canh, f"Trừ kho phục hồi đơn hủy #{ma_don}"
-                )
-
-            # Cập nhật trạng thái mới vào database
             await conn.execute("UPDATE orders SET trang_thai = $1 WHERE ma_don = $2", new_status, ma_don)
-
-        emoji_map = {"cho_thanh_toan": "⏳", "da_thanh_toan": "✅", "da_huy": "❌"}
-        await update.message.reply_text(f"{emoji_map[new_status]} Đơn hàng #{ma_don} đã đổi trạng thái sang: *{new_status.upper()}*", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Đơn #{ma_don} đổi sang: *{new_status.upper()}*", parse_mode="Markdown")
     except Exception as e:
-        await update.message.reply_text(f"❌ Không thể chuyển trạng thái đơn: {str(e)}")
+        await update.message.reply_text(f"❌ Lỗi: {str(e)}")
     finally:
         await conn.close()
 
 
 @owner_only
 async def xem_don_hang(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/donhang — Danh sách các đơn chờ khách thanh toán tiền mặt/chuyển khoản ngân hàng."""
+    """/donhang — Xem các đơn đang nợ tiền."""
     conn = await get_db_connection()
     try:
-        rows = await conn.fetch("""
-            SELECT ma_don, sdt_khach, so_canh, loai_canh, mau_sac, tong_tien_thuc_te 
-            FROM orders WHERE trang_thai = 'cho_thanh_toan' 
-            ORDER BY ngay_tao DESC LIMIT 15
-        """)
-        if not rows:
-            await update.message.reply_text("✅ Sổ đơn sạch sẽ! Không có đơn hàng nào bị nợ tiền.")
-            return
+        rows = await conn.fetch("SELECT ma_don, sdt_khach, chi_tiet_text, tong_tien_thuc_te FROM orders WHERE trang_thai = 'cho_thanh_toan' ORDER BY ngay_tao DESC LIMIT 15")
+        if not rows: return await update.message.reply_text("✅ Sổ đơn sạch sẽ! Không có đơn nợ.")
 
-        lines = [f"⏳ *DANH SÁCH {len(rows)} ĐƠN ĐANG CHỜ THANH TOÁN TIỀN:*\n"]
+        lines = [f"⏳ *DANH SÁCH {len(rows)} ĐƠN ĐANG CHỜ THANH TOÁN:*\n"]
         for row in rows:
-            loai_txt = "Đơn" if row['loai_canh'] == 'don' else "Đôi"
-            lines.append(
-                f"🔖 Đơn *#{row['ma_don']}* — ĐT Khách: `{row['sdt_khach']}`\n"
-                f"   ↳ Cấu hình: {row['so_canh']} c cành {loai_txt} ({row['mau_sac']})\n"
-                f"   💰 Tiền thực thu: *{int(row['tong_tien_thuc_te']):,}đ*\n"
-            )
+            lines.append(f"🔖 Đơn *#{row['ma_don']}* — ĐT: `{row['sdt_khach']}`\n   ↳ Gồm: {row['chi_tiet_text']}\n   💰 Thực thu: *{int(row['tong_tien_thuc_te']):,}đ*\n")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
     finally:
         await conn.close()
@@ -595,68 +502,24 @@ async def cong_so(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @owner_only
 async def lich_su_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/lichsu [dd/mm] — Xem lịch sử đơn đã thanh toán. Không nhập ngày = hôm nay."""
+    """/lichsu [dd/mm]"""
     from datetime import datetime, date
-
     args = context.args
-    if args:
-        try:
-            ngay_xem = datetime.strptime(args[0], "%d/%m").replace(
-                year=date.today().year
-            ).date()
-        except ValueError:
-            await update.message.reply_text(
-                "❌ Sai định dạng ngày! Hãy gõ theo mẫu: `/lichsu 25/01`",
-                parse_mode="Markdown"
-            )
-            return
-    else:
-        ngay_xem = date.today()
-
+    ngay_xem = datetime.strptime(args[0], "%d/%m").replace(year=date.today().year).date() if args else date.today()
     nhan_ngay = ngay_xem.strftime("%d/%m/%Y")
-    conn = None  # Khởi tạo biến để an toàn cho khối finally
+    
+    conn = await get_db_connection()
     try:
-        conn = await get_db_connection()
-        rows = await conn.fetch("""
-            SELECT ma_don, sdt_khach, so_canh, loai_canh, mau_sac,
-                   tong_tien_ly_tuong, giam_gia, tong_tien_thuc_te, ngay_tao
-            FROM orders
-            WHERE (ngay_tao AT TIME ZONE 'Asia/Ho_Chi_Minh')::date = $1 AND trang_thai = 'da_thanh_toan'
-            ORDER BY ngay_tao ASC
-        """, ngay_xem)
+        rows = await conn.fetch("SELECT ma_don, sdt_khach, chi_tiet_text, giam_gia, tong_tien_thuc_te, ngay_tao FROM orders WHERE (ngay_tao AT TIME ZONE 'Asia/Ho_Chi_Minh')::date = $1 AND trang_thai = 'da_thanh_toan' ORDER BY ngay_tao ASC", ngay_xem)
+        if not rows: return await update.message.reply_text(f"📭 Ngày *{nhan_ngay}* chưa có đơn nào.", parse_mode="Markdown")
 
-
-        if not rows:
-            await update.message.reply_text(
-                f"📭 Ngày *{nhan_ngay}* chưa có đơn nào được thanh toán.",
-                parse_mode="Markdown"
-            )
-            return
-
-        tong_tien = sum(int(r["tong_tien_thuc_te"]) for r in rows)
-        tong_giam = sum(int(r["giam_gia"]) for r in rows)
-
-        lines = [f"✅ *LỊCH SỬ {len(rows)} ĐƠN ĐÃ THU TIỀN — Ngày {nhan_ngay}*\n"]
+        tong_tien, tong_giam = sum(int(r["tong_tien_thuc_te"]) for r in rows), sum(int(r["giam_gia"]) for r in rows)
+        lines = [f"✅ *LỊCH SỬ {len(rows)} ĐƠN NGÀY {nhan_ngay}*\n"]
         for i, row in enumerate(rows, 1):
-            loai_txt = "Đơn" if row["loai_canh"] == "don" else "Đôi"
             gio = row["ngay_tao"].strftime("%H:%M")
-            lines.append(
-                f"{i}. 🔖 Đơn *#{row['ma_don']}* — {gio} — ĐT: `{row['sdt_khach']}`\n"
-                f"   ↳ {row['so_canh']} cành {loai_txt} ({row['mau_sac']})\n"
-                f"   💰 Thực thu: *{int(row['tong_tien_thuc_te']):,}đ*"
-                + (f" _(bớt {int(row['giam_gia']):,}đ)_" if row["giam_gia"] > 0 else "")
-                + "\n"
-            )
-
-        lines.append(
-            f"───────────────────\n"
-            f"🧾 Tổng *{len(rows)} đơn* | Thu về: *{tong_tien:,}đ*"
-            + (f" | Đã bớt: {tong_giam:,}đ" if tong_giam > 0 else "")
-        )
-
+            lines.append(f"{i}. 🔖 *#{row['ma_don']}* — {gio} — ĐT: `{row['sdt_khach']}`\n   ↳ {row['chi_tiet_text']}\n   💰 Thực thu: *{int(row['tong_tien_thuc_te']):,}đ*\n")
+        lines.append(f"───────────────────\n🧾 Tổng thu: *{tong_tien:,}đ*")
         await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
-    except Exception as e:
-        await update.message.reply_text(f"❌ Lỗi khi tra lịch sử: {str(e)}")
     finally:
         await conn.close()
 
