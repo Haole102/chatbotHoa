@@ -12,6 +12,7 @@ Tính năng:
 
 import os
 import json # ← Thêm dòng này để hỗ trợ lưu cấu hình chậu ghép
+import google.generativeai as genai
 import logging
 import asyncpg
 import functools  # ← thêm dòng này
@@ -29,6 +30,15 @@ load_dotenv()
 BOT_TOKEN     = os.getenv("BOT_TOKEN")
 DATABASE_URL  = os.getenv("DATABASE_URL")
 OWNER_CHAT_ID = int(os.getenv("OWNER_CHAT_ID", "0"))
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+
+DB_SCHEMA = """
+Bạn là trợ lý AI phân tích dữ liệu cho cửa hàng hoa lan. Bạn có công cụ execute_sql để truy vấn cơ sở dữ liệu PostgreSQL.
+Cấu trúc các bảng:
+- Bảng orders: ma_don, sdt_khach, so_canh, loai_canh ('don' hoặc 'doi'), mau_sac, giam_gia, tong_tien_thuc_te, trang_thai ('cho_thanh_toan', 'da_thanh_toan', 'da_huy'), ngay_tao.
+- Bảng products: id, loai_canh, mau_sac, so_luong_ton.
+Lưu ý: Chỉ được phép viết câu lệnh SELECT. Tuyệt đối không dùng INSERT, UPDATE, DELETE.
+"""
 
 # Đơn giá niêm yết cố định của cửa hàng (Bán lẻ cành đơn/đôi)
 PRICES = {
@@ -523,6 +533,99 @@ async def lich_su_don(update: Update, context: ContextTypes.DEFAULT_TYPE):
     finally:
         await conn.close()
 
+# 2. TẠO CÔNG CỤ (TOOL) EXECUTE_SQL CHO AI
+async def execute_sql(query: str) -> str:
+    """Công cụ thực thi lệnh SQL lấy dữ liệu. Đã được bọc thép 2 lớp an toàn."""
+    
+    # LỚP BẢO VỆ 1 (Ở cấp độ Code Python): Chặn ngay từ cửa nếu phát hiện lệnh lạ
+    if not query.strip().upper().startswith("SELECT"):
+        return "Lỗi bảo mật: Tôi chỉ được phép dùng lệnh SELECT để đọc dữ liệu."
+    
+    # LỚP BẢO VỆ 2 (Ở cấp độ Database): Kết nối bằng User ai_reader
+    readonly_url = os.getenv("DATABASE_READONLY_URL")
+    if readonly_url and "localhost" in readonly_url:
+        readonly_url = readonly_url.replace("localhost", "127.0.0.1")
+        
+    conn = await asyncpg.connect(readonly_url)
+    try:
+        rows = await conn.fetch(query)
+        result = [dict(row) for row in rows]
+        return __import__('json').dumps(result, default=str)
+    except Exception as e:
+        return f"Lỗi truy vấn SQL: {str(e)}"
+    finally:
+        await conn.close()
+
+# 3. LỆNH TELEGRAM ĐỂ MẸ BẠN CHAT VỚI AI
+# 1. THÊM HÀM MỒI NÀY NGAY TRÊN HÀM hoi_dap_ai
+def tra_cuu_sql(query: str) -> str:
+    """Công cụ thực thi lệnh SQL SELECT để lấy dữ liệu từ cơ sở dữ liệu PostgreSQL."""
+    pass
+
+
+# 2. HÀM XỬ LÝ CHÍNH ĐÃ ĐƯỢC CẬP NHẬT
+@owner_only
+async def hoi_dap_ai(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/hoi [câu_hỏi] - Ví dụ: /hoi Hôm nay doanh thu thế nào rồi?"""
+    user_query = " ".join(context.args)
+    if not user_query:
+        await update.message.reply_text("❌ Bạn chưa nhập câu hỏi. Ví dụ: /hoi Hôm nay bán được bao nhiêu tiền?")
+        return
+
+    msg = await update.message.reply_text("🧠 Trợ lý AI đang tra sổ sách, vui lòng đợi chút...")
+
+    try:
+        # Khởi tạo model và truyền HÀM MỒI vào để thư viện tự động tạo schema chuẩn 100%
+        model = genai.GenerativeModel(
+            model_name='gemini-2.5-flash',
+            system_instruction=DB_SCHEMA,
+            tools=[tra_cuu_sql] # ← Bí quyết nằm ở đây
+        )
+        
+        chat = model.start_chat()
+        response = chat.send_message(user_query)
+
+        # Trích xuất yêu cầu gọi hàm từ AI
+        function_call = None
+        if response.parts:
+            for part in response.parts:
+                if part.function_call:
+                    function_call = part.function_call
+                    break
+
+        # Nếu AI yêu cầu dùng công cụ tra_cuu_sql
+        if function_call and function_call.name == "tra_cuu_sql":
+            # Lấy câu lệnh SQL ra một cách an toàn
+            try:
+                sql_query = function_call.args['query']
+            except Exception:
+                sql_query = type(function_call).to_dict(function_call).get("args", {}).get("query")
+            
+            if not sql_query:
+                await msg.edit_text("❌ AI không tạo được câu lệnh SQL hợp lệ.")
+                return
+            
+            # ⚡ CHẠY HÀM TRUY VẤN DB THẬT CỦA BẠN TẠI ĐÂY
+            db_result = await execute_sql(sql_query)
+            
+            # Gửi kết quả DB ngược lại cho AI
+            final_response = chat.send_message(
+                genai.protos.Part(
+                    function_response=genai.protos.FunctionResponse(
+                        name="tra_cuu_sql",
+                        response={"result": db_result}
+                    )
+                )
+            )
+            
+            await msg.edit_text(f"🗣️ **AI Trả lời:**\n{final_response.text}\n\n_(Đã tra cứu tự động)_", parse_mode="Markdown")
+        else:
+            # Nếu AI chỉ trả lời giao tiếp thông thường
+            await msg.edit_text(f"🗣️ **AI Trả lời:**\n{response.text}", parse_mode="Markdown")
+
+    except Exception as e:
+        await msg.edit_text(f"❌ Lỗi xử lý AI: {str(e)}")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # KHỞI CHẠY HỆ THỐNG
 # ══════════════════════════════════════════════════════════════════════════════
@@ -550,6 +653,7 @@ def main():
     application.add_handler(CommandHandler("capnhat",   cap_nhat_don))
     application.add_handler(CommandHandler("congso",    cong_so))
     application.add_handler(CommandHandler("lichsu",    lich_su_don))
+    application.add_handler(CommandHandler("hoi",       hoi_dap_ai))
 
     logger.info("🤖 Bot quản lý hoa lan thực chiến đang lắng nghe tín hiệu Polling...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
